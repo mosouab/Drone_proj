@@ -24,7 +24,16 @@ docker-compose up -d
 docker exec -it drone_dev_env bash
 ```
 
-### 3. Launch the PX4 SITL Simulation
+### 3. Clone PX4-Autopilot
+
+If you haven't already cloned PX4-Autopilot, do so in the workspace directory:
+
+```bash
+cd /root/workspace
+git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+```
+
+### 4. Launch the PX4 SITL Simulation
 
 Inside the container, navigate to the PX4-Autopilot directory and launch the simulation:
 
@@ -38,7 +47,7 @@ This will start:
 - Gazebo simulation environment
 - MAVLink communication on default ports (UDP 14550, 14540)
 
-### 4. Run Drone Control Scripts
+### 5. Run Drone Control Scripts
 
 The workspace contains several control utilities in `/root/workspace/bin/`:
 - `drone_ctrl` - Manual drone control
