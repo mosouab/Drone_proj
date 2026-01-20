@@ -8,7 +8,7 @@
 
 // Inclusion des headers MAVLink
 // Chemin relatif depuis workspace/src -> workspace/libs
-#include "../libs/mavlink/common/mavlink.h"
+#include "../../libs/mavlink/common/mavlink.h"
 
 #define TARGET_IP "127.0.0.1"
 #define TARGET_PORT 14580
@@ -21,6 +21,13 @@ typedef struct {
     float alt_m;
 } waypoint_t;
 
+static int send_message(int sock, const struct sockaddr_in *target_addr, const mavlink_message_t *msg)
+{
+    uint8_t tx_buf[BUFFER_LENGTH];
+    int len = mavlink_msg_to_send_buffer(tx_buf, msg);
+    return (int)sendto(sock, tx_buf, len, 0, (const struct sockaddr *)target_addr, sizeof(*target_addr));
+}
+
 static int send_command_long(int sock,
                              const struct sockaddr_in *target_addr,
                              uint8_t target_system,
@@ -30,7 +37,6 @@ static int send_command_long(int sock,
 {
     mavlink_message_t cmd_msg;
     mavlink_command_long_t cmd;
-    uint8_t tx_buf[BUFFER_LENGTH];
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.target_system = target_system;
@@ -46,8 +52,61 @@ static int send_command_long(int sock,
     cmd.param7 = p7;
 
     mavlink_msg_command_long_encode(255, 1, &cmd_msg, &cmd);
-    int len = mavlink_msg_to_send_buffer(tx_buf, &cmd_msg);
-    return (int)sendto(sock, tx_buf, len, 0, (const struct sockaddr *)target_addr, sizeof(*target_addr));
+    return send_message(sock, target_addr, &cmd_msg);
+}
+
+static int send_mission_count(int sock,
+                              const struct sockaddr_in *target_addr,
+                              uint8_t target_system,
+                              uint8_t target_component,
+                              uint16_t count)
+{
+    mavlink_message_t msg;
+    mavlink_mission_count_t mc;
+    
+    memset(&mc, 0, sizeof(mc));
+    mc.target_system = target_system;
+    mc.target_component = target_component;
+    mc.count = count;
+    mc.mission_type = MAV_MISSION_TYPE_MISSION;
+
+    mavlink_msg_mission_count_encode(255, 1, &msg, &mc);
+    return send_message(sock, target_addr, &msg);
+}
+
+static int send_mission_item_int(int sock,
+                                 const struct sockaddr_in *target_addr,
+                                 uint8_t target_system,
+                                 uint8_t target_component,
+                                 uint16_t seq,
+                                 uint16_t command,
+                                 uint8_t frame,
+                                 float p1, float p2, float p3, float p4,
+                                 int32_t x, int32_t y, float z,
+                                 uint8_t current)
+{
+    mavlink_message_t msg;
+    mavlink_mission_item_int_t item;
+    
+    memset(&item, 0, sizeof(item));
+    item.target_system = target_system;
+    item.target_component = target_component;
+    item.seq = seq;
+    item.frame = frame;
+    item.command = command;
+    item.current = current;
+    item.autocontinue = 1;
+    item.param1 = p1;
+    item.param2 = p2;
+    item.param3 = p3;
+    item.param4 = p4;
+    item.x = x;
+    item.y = y;
+    item.z = z;
+    item.mission_type = MAV_MISSION_TYPE_MISSION;
+
+    mavlink_msg_mission_item_int_encode(255, 1, &msg, &item);
+    return send_message(sock, target_addr, &msg);
 }
 
 int main() {
@@ -59,9 +118,6 @@ int main() {
     ssize_t recsize;
     socklen_t fromlen;
 
-    // Liste des waypoints à suivre
-    // Coordonnées GPS pour SITL (région de Zurich par défaut)
-    // Trajectoire en forme de cœur
     const waypoint_t waypoints[] = {
         {47.3975000, 8.5456000, 500.0f},  // Point bas du cœur
         {47.3976500, 8.5454000, 500.0f},  // Côté gauche montant
@@ -103,8 +159,13 @@ int main() {
 
     // 2. Boucle principale
     int connection_established = 0;
+    int mission_upload_started = 0;
+    int mission_started = 0;
     uint8_t target_system = 1;
     uint8_t target_component = 1;
+    
+    // Mission : TAKEOFF + waypoints + LAND
+    const int mission_count = 1 + num_waypoints + 1;
     
     while(1) {
         memset(buf, 0, BUFFER_LENGTH);
@@ -130,54 +191,91 @@ int main() {
                         if (!connection_established) {
                             printf("Drone connecté !\n");
                             connection_established = 1;
-
                             target_system = msg.sysid;
                             target_component = msg.compid;
+                        }
 
-                            // ÉTAPE A : ARMEMENT (Allumer les moteurs)
-                            send_command_long(sock, &targetAddr, target_system, target_component,
-                                              MAV_CMD_COMPONENT_ARM_DISARM,
-                                              1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-                            printf("Commande ARM envoyée.\n");
+                        // Démarrer l'upload de mission après connexion
+                        if (connection_established && !mission_upload_started) {
+                            printf("Upload de la mission (%d items)...\n", mission_count);
+                            send_mission_count(sock, &targetAddr, target_system, target_component, mission_count);
+                            mission_upload_started = 1;
+                        }
+                    }
 
-                            sleep(2); // Petite pause pour laisser le temps d'armer
+                    // Le drone demande un item de mission
+                    if (msg.msgid == MAVLINK_MSG_ID_MISSION_REQUEST_INT) {
+                        mavlink_mission_request_int_t req;
+                        mavlink_msg_mission_request_int_decode(&msg, &req);
 
-                            // ÉTAPE B : DÉCOLLAGE (Takeoff)
-                            send_command_long(sock, &targetAddr, target_system, target_component,
-                                              MAV_CMD_NAV_TAKEOFF,
-                                              0.0f, 0.0f, 0.0f, 0.0f,
-                                              NAN, NAN, 500.0f);
-                            printf("Commande TAKEOFF envoyée (50m).\n");
+                        if (req.mission_type != MAV_MISSION_TYPE_MISSION) {
+                            continue;
+                        }
 
-                            sleep(8); // Attendre que le drone décolle
+                        int32_t lat, lon;
 
-                            // ÉTAPE C : NAVIGATION VERS WAYPOINTS
-                            printf("Navigation vers %d waypoints...\n", num_waypoints);
-                            for (int wp = 0; wp < num_waypoints; wp++) {
-                                send_command_long(sock, &targetAddr, target_system, target_component,
-                                                  MAV_CMD_DO_REPOSITION,
-                                                  -1.0f,   // Ground speed (-1 = default)
-                                                  1.0f,    // Bitmask (1 = use heading)
-                                                  0.0f,    // Reserved
-                                                  NAN,     // Yaw (NaN = maintain current)
-                                                  waypoints[wp].lat_deg,
-                                                  waypoints[wp].lon_deg,
-                                                  waypoints[wp].alt_m);
-                                printf("Waypoint %d/%d envoyé (lat=%.6f, lon=%.6f, alt=%.1fm)\n", 
-                                       wp+1, num_waypoints,
-                                       waypoints[wp].lat_deg, 
-                                       waypoints[wp].lon_deg,
-                                       waypoints[wp].alt_m);
+                        if (req.seq == 0) {
+                            // Item 0 : TAKEOFF
+                            lat = (int32_t)(waypoints[0].lat_deg * 1e7);
+                            lon = (int32_t)(waypoints[0].lon_deg * 1e7);
+                            send_mission_item_int(sock, &targetAddr, target_system, target_component,
+                                                  req.seq, MAV_CMD_NAV_TAKEOFF,
+                                                  MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                                                  0.0f, 0.0f, 0.0f, NAN,
+                                                  lat, lon, 500.0f, 1);
+                            printf("Item %d/%d envoyé: TAKEOFF\n", req.seq + 1, mission_count);
+                        } 
+                        else if (req.seq <= num_waypoints) {
+                            // Items 1 à num_waypoints : WAYPOINT
+                            int wp_idx = req.seq - 1;
+                            lat = (int32_t)(waypoints[wp_idx].lat_deg * 1e7);
+                            lon = (int32_t)(waypoints[wp_idx].lon_deg * 1e7);
+                            send_mission_item_int(sock, &targetAddr, target_system, target_component,
+                                                  req.seq, MAV_CMD_NAV_WAYPOINT,
+                                                  MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                                                  0.0f, 2.0f, 0.0f, NAN,
+                                                  lat, lon, waypoints[wp_idx].alt_m, 0);
+                            printf("Item %d/%d envoyé: WAYPOINT %d\n", req.seq + 1, mission_count, wp_idx + 1);
+                        } 
+                        else {
+                            // Dernier item : LAND
+                            int last_idx = num_waypoints - 1;
+                            lat = (int32_t)(waypoints[last_idx].lat_deg * 1e7);
+                            lon = (int32_t)(waypoints[last_idx].lon_deg * 1e7);
+                            send_mission_item_int(sock, &targetAddr, target_system, target_component,
+                                                  req.seq, MAV_CMD_NAV_LAND,
+                                                  MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                                                  0.0f, 0.0f, 0.0f, NAN,
+                                                  lat, lon, 0.0f, 0);
+                            printf("Item %d/%d envoyé: LAND\n", req.seq + 1, mission_count);
+                        }
+                    }
+
+                    // Confirmation que la mission est acceptée
+                    if (msg.msgid == MAVLINK_MSG_ID_MISSION_ACK) {
+                        mavlink_mission_ack_t ack;
+                        mavlink_msg_mission_ack_decode(&msg, &ack);
+                        
+                        if (ack.mission_type == MAV_MISSION_TYPE_MISSION && !mission_started) {
+                            if (ack.type == MAV_MISSION_ACCEPTED) {
+                                printf("Mission acceptée ! Démarrage...\n");
                                 
-                                sleep(5); // Attendre entre chaque waypoint
-                            }
+                                // ÉTAPE A : ARMEMENT
+                                send_command_long(sock, &targetAddr, target_system, target_component,
+                                                  MAV_CMD_COMPONENT_ARM_DISARM,
+                                                  1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                                printf("Commande ARM envoyée.\n");
+                                sleep(2);
 
-                            // ÉTAPE D : ATTERRISSAGE (Landing)
-                            printf("Navigation terminée. Commande LAND envoyée.\n");
-                            send_command_long(sock, &targetAddr, target_system, target_component,
-                                              MAV_CMD_NAV_LAND,
-                                              0.0f, 0.0f, 0.0f, 0.0f,
-                                              NAN, NAN, 0.0f);
+                                // ÉTAPE B : DÉMARRAGE DE LA MISSION
+                                send_command_long(sock, &targetAddr, target_system, target_component,
+                                                  MAV_CMD_MISSION_START,
+                                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                                printf("Mission démarrée ! Le drone va suivre les waypoints en forme de cœur.\n");
+                                mission_started = 1;
+                            } else {
+                                printf("Erreur mission: type=%u\n", ack.type);
+                            }
                         }
                     }
                 }
