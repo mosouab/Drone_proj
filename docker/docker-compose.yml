@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  drone-dev:
+    build: .
+    container_name: drone_dev_env
+    image: drone-ros-noetic
+    # Mode réseau "host" permet au conteneur d'accéder aux ports UDP/TCP
+    # Indispensable pour MAVLink et la communication avec QGroundControl sur Windows
+    network_mode: host 
+    
+    # Configuration pour l'affichage graphique (Gazebo/Rviz) via WSLg
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+      - PULSE_SERVER=${PULSE_SERVER}
+    
+    # Montage des volumes pour l'affichage graphique
+    volumes:
+      # Ton code source (partagé entre Windows et le conteneur)
+      - ../workspace:/root/workspace
+      # Sockets pour l'affichage graphique WSLg
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /mnt/wslg:/mnt/wslg
+    
+    # Options pour garantir l'accès au hardware si besoin
+    privileged: true
+    tty: true
+    stdin_open: true
